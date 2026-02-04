@@ -1,0 +1,17 @@
+# Charter & Stone Planner MCP Server
+# Dependencies for Microsoft Graph API integration
+
+# MCP SDK (includes FastMCP)
+mcp>=1.0.0
+
+# Microsoft Authentication Library
+msal>=1.24.0
+
+# Async HTTP client
+httpx>=0.25.0
+
+# Data validation
+pydantic>=2.0.0
+
+# Environment variable management
+python-dotenv>=1.0.0
