@@ -1,21 +1,26 @@
 """
-Charter & Stone MCP Server V2.5 - "Interactive Edition"
+Charter & Stone MCP Server V2.6.1 - "Interactive Edition"
 
 Architecture V3 Compliant:
 - Full Planner CRUD for interactive sessions
 - SSH health checks with auto-reconnect
 - Bucket-aware operations
+- Checklist management (fixed Graph API validation)
 - process_signals REMOVED (now handled by Power Automate)
 
 Features:
 1. Oracle Search (SSH to Pi)
 2. Planner Read: list_tasks, get_task_details
 3. Planner Write: create_task, update_task, complete_task, move_task
+4. Checklist: update_checklist_item, add_checklist_item
 """
 
 import os
 import json
 import sys
+import logging
+import time
+import uuid
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional
@@ -37,6 +42,21 @@ except ImportError as e:
 # Load environment
 env_path = Path(__file__).parent / '.env'
 load_dotenv(dotenv_path=env_path)
+
+# ============================================================================
+# DIAGNOSTIC LOGGING
+# ============================================================================
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(r'C:\Users\tasms\CharterStone\PlannerMCP\server_debug.log'),
+        logging.StreamHandler()
+    ]
+)
+
+logger = logging.getLogger(__name__)
 
 # ============================================================================
 # CONFIGURATION
@@ -210,6 +230,56 @@ def get_access_token() -> str:
         raise Exception(f"Auth failed: {result.get('error_description')}")
 
 
+def timed_graph_call(func_name: str, method: str, url: str, **kwargs) -> requests.Response:
+    """
+    Wrapper to log timing and success/failure of Graph API calls
+
+    Args:
+        func_name: Name of calling function (for log correlation)
+        method: HTTP method ("GET", "POST", "PATCH", "DELETE")
+        url: Full Graph API URL
+        **kwargs: Headers, JSON body, etc. (passed to requests)
+
+    Returns:
+        requests.Response object
+
+    Raises:
+        Re-raises any exception after logging details
+    """
+
+    start_time = time.time()
+
+    logger.info("[GRAPH_API_START] %s - %s %s", func_name, method, url)
+
+    try:
+        response = requests.request(method, url, **kwargs)
+
+        elapsed = time.time() - start_time
+
+        logger.info(
+            "[GRAPH_API_SUCCESS] %s - %.2fs - Status: %s",
+            func_name,
+            elapsed,
+            response.status_code
+        )
+
+        return response
+
+    except Exception as e:
+        elapsed = time.time() - start_time
+
+        logger.error(
+            "[GRAPH_API_FAILURE] %s - %.2fs - Error: %s",
+            func_name,
+            elapsed,
+            str(e)
+        )
+        logger.error("[GRAPH_API_FAILURE] Exception Type: %s", type(e).__name__)
+        logger.exception("[GRAPH_API_FAILURE] Stack Trace:")
+
+        raise
+
+
 def graph_request(method: str, endpoint: str, data: dict = None, headers_extra: dict = None) -> dict:
     """Make Graph API request."""
     token = get_access_token()
@@ -219,23 +289,23 @@ def graph_request(method: str, endpoint: str, data: dict = None, headers_extra: 
     }
     if headers_extra:
         headers.update(headers_extra)
-    
+
     url = f"https://graph.microsoft.com/v1.0{endpoint}"
-    
+
     if method == "GET":
-        response = requests.get(url, headers=headers)
+        response = timed_graph_call("graph_request", "GET", url, headers=headers)
     elif method == "POST":
-        response = requests.post(url, headers=headers, json=data)
+        response = timed_graph_call("graph_request", "POST", url, headers=headers, json=data)
     elif method == "PATCH":
-        response = requests.patch(url, headers=headers, json=data)
+        response = timed_graph_call("graph_request", "PATCH", url, headers=headers, json=data)
     elif method == "DELETE":
-        response = requests.delete(url, headers=headers)
+        response = timed_graph_call("graph_request", "DELETE", url, headers=headers)
     else:
         raise ValueError(f"Unknown method: {method}")
-    
+
     if response.status_code == 204:
         return {}
-    
+
     response.raise_for_status()
     return response.json()
 
@@ -494,6 +564,46 @@ async def list_tools() -> list[Tool]:
                 "properties": {},
                 "required": []
             }
+        ),
+        Tool(
+            name="update_checklist_item",
+            description="Check or uncheck a checklist item on a Planner task.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "task_id": {
+                        "type": "string",
+                        "description": "The Planner task ID"
+                    },
+                    "item_title": {
+                        "type": "string",
+                        "description": "The checklist item title (partial match supported)"
+                    },
+                    "is_checked": {
+                        "type": "boolean",
+                        "description": "True to check, False to uncheck"
+                    }
+                },
+                "required": ["task_id", "item_title", "is_checked"]
+            }
+        ),
+        Tool(
+            name="add_checklist_item",
+            description="Add a new checklist item to a Planner task.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "task_id": {
+                        "type": "string",
+                        "description": "The Planner task ID"
+                    },
+                    "item_title": {
+                        "type": "string",
+                        "description": "The checklist item text"
+                    }
+                },
+                "required": ["task_id", "item_title"]
+            }
         )
     ]
 
@@ -734,6 +844,92 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             )
             
             return [TextContent(type="text", text=f"✅ Task moved to '{bucket_name}': {task.get('title')}")]
+
+        # =====================================================================
+        # UPDATE CHECKLIST ITEM
+        # =====================================================================
+        elif name == "update_checklist_item":
+            task_id = arguments.get("task_id")
+            item_title = arguments.get("item_title")
+            is_checked = arguments.get("is_checked")
+
+            # Get current task details
+            details = graph_request("GET", f"/planner/tasks/{task_id}/details")
+            etag = details.get('@odata.etag')
+            checklist = details.get('checklist', {})
+
+            # Find the item (partial match)
+            found_id = None
+            found_title = None
+            for item_id, item in checklist.items():
+                if item_title.lower() in item.get('title', '').lower():
+                    found_id = item_id
+                    found_title = item.get('title')
+                    break
+
+            if not found_id:
+                available = [item.get('title') for item in checklist.values()]
+                return [TextContent(type="text", text=f"❌ Checklist item not found: '{item_title}'\n\nAvailable items:\n" + "\n".join(f"  • {t}" for t in available))]
+
+            # Build clean checklist with only writable fields
+            clean_checklist = {}
+            for item_id, item in checklist.items():
+                clean_checklist[item_id] = {
+                    "@odata.type": "#microsoft.graph.plannerChecklistItem",
+                    "title": item.get('title'),
+                    "isChecked": item.get('isChecked', False)
+                }
+
+            # Update the target item
+            clean_checklist[found_id]['isChecked'] = is_checked
+
+            graph_request(
+                "PATCH",
+                f"/planner/tasks/{task_id}/details",
+                {"checklist": clean_checklist},
+                {"If-Match": etag}
+            )
+
+            status = "checked ✅" if is_checked else "unchecked ⬜"
+            return [TextContent(type="text", text=f"✅ Checklist item {status}: {found_title}")]
+
+        # =====================================================================
+        # ADD CHECKLIST ITEM
+        # =====================================================================
+        elif name == "add_checklist_item":
+            task_id = arguments.get("task_id")
+            item_title = arguments.get("item_title")
+
+            # Get current task details
+            details = graph_request("GET", f"/planner/tasks/{task_id}/details")
+            etag = details.get('@odata.etag')
+            checklist = details.get('checklist', {})
+
+            # Build clean checklist with only writable fields
+            clean_checklist = {}
+            for item_id, item in checklist.items():
+                clean_checklist[item_id] = {
+                    "@odata.type": "#microsoft.graph.plannerChecklistItem",
+                    "title": item.get('title'),
+                    "isChecked": item.get('isChecked', False)
+                }
+
+            # Generate a unique ID and add new item
+            new_id = str(uuid.uuid4())[:8]
+            clean_checklist[new_id] = {
+                "@odata.type": "#microsoft.graph.plannerChecklistItem",
+                "title": item_title,
+                "isChecked": False
+            }
+
+            graph_request(
+                "PATCH",
+                f"/planner/tasks/{task_id}/details",
+                {"checklist": clean_checklist},
+                {"If-Match": etag}
+            )
+
+            return [TextContent(type="text", text=f"✅ Checklist item added: {item_title}")]
         
         # =====================================================================
         # UNKNOWN TOOL
@@ -755,7 +951,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
 async def main():
     print("=" * 60, file=sys.stderr)
-    print("Charter & Stone MCP Server V2.5 - Interactive Edition", file=sys.stderr)
+    print("Charter & Stone MCP Server V2.6.1 - Interactive Edition", file=sys.stderr)
     print("=" * 60, file=sys.stderr)
     
     # Pre-flight checks
@@ -774,7 +970,8 @@ async def main():
     print("", file=sys.stderr)
     print("Available tools: search_oracle, list_tasks, get_task_details,", file=sys.stderr)
     print("                 create_task, update_task, complete_task,", file=sys.stderr)
-    print("                 move_task, list_buckets", file=sys.stderr)
+    print("                 move_task, list_buckets, update_checklist_item,", file=sys.stderr)
+    print("                 add_checklist_item", file=sys.stderr)
     print("=" * 60, file=sys.stderr)
     
     async with mcp.server.stdio.stdio_server() as (read_stream, write_stream):

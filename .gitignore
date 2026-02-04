@@ -54,6 +54,9 @@ logs/
 .ssh/
 id_rsa
 id_rsa.pub
+C:Userstasms.ssh/
+*.pem
+*.key
 
 # JSON data files
 watchdog_history.json
@@ -61,3 +64,6 @@ watchdog_history.json
 # Temporary files
 *.tmp
 *.temp
+
+# Local backups
+Planner-MCP/backups/
