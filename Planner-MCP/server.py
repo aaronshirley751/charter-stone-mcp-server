@@ -295,32 +295,36 @@ def timed_graph_call(func_name: str, method: str, url: str, **kwargs) -> request
 
 def graph_request(method: str, endpoint: str, data: dict = None, headers_extra: dict = None) -> dict:
     """Make Graph API request."""
-    token = get_access_token()
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json"
-    }
-    if headers_extra:
-        headers.update(headers_extra)
+    try:
+        token = get_access_token()
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json"
+        }
+        if headers_extra:
+            headers.update(headers_extra)
 
-    url = f"https://graph.microsoft.com/v1.0{endpoint}"
+        url = f"https://graph.microsoft.com/v1.0{endpoint}"
 
-    if method == "GET":
-        response = timed_graph_call("graph_request", "GET", url, headers=headers)
-    elif method == "POST":
-        response = timed_graph_call("graph_request", "POST", url, headers=headers, json=data)
-    elif method == "PATCH":
-        response = timed_graph_call("graph_request", "PATCH", url, headers=headers, json=data)
-    elif method == "DELETE":
-        response = timed_graph_call("graph_request", "DELETE", url, headers=headers)
-    else:
-        raise ValueError(f"Unknown method: {method}")
+        if method == "GET":
+            response = timed_graph_call("graph_request", "GET", url, headers=headers)
+        elif method == "POST":
+            response = timed_graph_call("graph_request", "POST", url, headers=headers, json=data)
+        elif method == "PATCH":
+            response = timed_graph_call("graph_request", "PATCH", url, headers=headers, json=data)
+        elif method == "DELETE":
+            response = timed_graph_call("graph_request", "DELETE", url, headers=headers)
+        else:
+            raise ValueError(f"Unknown method: {method}")
 
-    if response.status_code == 204:
-        return {}
+        if response.status_code == 204:
+            return {}
 
-    response.raise_for_status()
-    return response.json()
+        response.raise_for_status()
+        return response.json()
+    except Exception as e:
+        logger.error(f"❌ Graph API Error: {str(e)}")
+        raise
 
 
 # ============================================================================
