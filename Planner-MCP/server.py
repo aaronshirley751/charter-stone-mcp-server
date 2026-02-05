@@ -210,20 +210,20 @@ def get_access_token() -> str:
         logger.debug(f"Found {len(accounts)} cached account(s)")
         result = app.acquire_token_silent(scopes=scopes, account=accounts[0])
         if result and "access_token" in result:
-            logger.info("✅ Using cached token")
+            logger.info("[OK] Using cached token")
             TOKEN_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
             TOKEN_CACHE_PATH.write_text(token_cache.serialize())
             return result['access_token']
     
     # No valid cached token - need interactive authentication
-    logger.info("⚠️ No valid cached token - initiating device code flow")
+    logger.info("[AUTH] No valid cached token - initiating device code flow")
     
     flow = app.initiate_device_flow(scopes=scopes)
     if "user_code" not in flow:
         raise ValueError("Failed to create device flow")
     
     print(f"\n{'='*60}", file=sys.stderr)
-    print(f"🔐 AUTHENTICATION REQUIRED", file=sys.stderr)
+    print(f"AUTHENTICATION REQUIRED", file=sys.stderr)
     print(f"   Visit:  {flow['verification_uri']}", file=sys.stderr)
     print(f"   Code:   {flow['user_code']}", file=sys.stderr)
     print(f"   Timeout: 300 seconds", file=sys.stderr)
@@ -233,13 +233,13 @@ def get_access_token() -> str:
     result = app.acquire_token_by_device_flow(flow)
     
     if "access_token" in result:
-        logger.info("✅ Device flow authentication successful")
+        logger.info("[OK] Device flow authentication successful")
         TOKEN_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
         TOKEN_CACHE_PATH.write_text(token_cache.serialize())
         return result['access_token']
     else:
         error_msg = result.get('error_description', 'Unknown error')
-        logger.error(f"❌ Auth failed: {error_msg}")
+        logger.error(f"[ERROR] Auth failed: {error_msg}")
         raise Exception(f"Auth failed: {error_msg}")
 
 
@@ -971,18 +971,14 @@ async def main():
     print("Charter & Stone MCP Server V2.6.1 - Interactive Edition", file=sys.stderr)
     print("=" * 60, file=sys.stderr)
     
-    # Pre-flight checks
-    try:
-        get_access_token()
-        print("✅ Microsoft Graph: Authenticated", file=sys.stderr)
-    except Exception as e:
-        print(f"⚠️  Microsoft Graph: Auth required - {e}", file=sys.stderr)
+    # Pre-flight checks (no blocking auth)
+    print("[INFO] Microsoft Graph: Auth will happen on first API call", file=sys.stderr)
     
     try:
         oracle_ssh.connect()
-        print(f"✅ SSH to Pi: Connected ({SSH_HOST})", file=sys.stderr)
+        print(f"[OK] SSH to Pi: Connected ({SSH_HOST})", file=sys.stderr)
     except Exception as e:
-        print(f"⚠️  SSH to Pi: Not connected - {e}", file=sys.stderr)
+        print(f"[WARN] SSH to Pi: Not connected - {e}", file=sys.stderr)
     
     print("", file=sys.stderr)
     print("Available tools: search_oracle, list_tasks, get_task_details,", file=sys.stderr)
