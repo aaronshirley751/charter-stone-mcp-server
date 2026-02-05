@@ -33,7 +33,8 @@ try:
     from msal import SerializableTokenCache
     from dotenv import load_dotenv
     from mcp.server import Server
-    from mcp.types import Tool, TextContent
+    from mcp.server.models import InitializationOptions
+    from mcp.types import Tool, TextContent, ServerCapabilities
     import mcp.server.stdio
 except ImportError as e:
     print(f"CRITICAL: Missing library: {e}", file=sys.stderr)
@@ -66,7 +67,7 @@ logger = logging.getLogger(__name__)
 # Microsoft Graph
 TENANT_ID = os.getenv("AZURE_TENANT_ID") or os.getenv("TENANT_ID")
 CLIENT_ID = os.getenv("AZURE_CLIENT_ID") or os.getenv("CLIENT_ID")
-TOKEN_CACHE_PATH = Path.home() / ".planner_mcp_token_cache.bin"
+TOKEN_CACHE_PATH = Path.home() / ".planner_mcp_token_cache.json"
 
 # Planner IDs (set these to avoid repeated lookups)
 PLAN_ID = os.getenv("PLANNER_PLAN_ID")  # Optional: hardcode for speed
@@ -187,6 +188,62 @@ oracle_ssh = OracleSSHClient()
 # MICROSOFT GRAPH AUTHENTICATION
 # ============================================================================
 
+def check_token_validity() -> bool:
+    """Check if valid cached token exists without triggering interactive auth.
+    
+    Returns:
+        True if valid cached token exists, False otherwise
+    """
+    try:
+        if not TOKEN_CACHE_PATH.exists():
+            print(f"[DEBUG] Token cache file not found: {TOKEN_CACHE_PATH}", file=sys.stderr)
+            return False
+        
+        print(f"[DEBUG] Token cache file exists: {TOKEN_CACHE_PATH}", file=sys.stderr)
+        
+        token_cache = SerializableTokenCache()
+        cache_content = TOKEN_CACHE_PATH.read_text()
+        print(f"[DEBUG] Token cache size: {len(cache_content)} bytes", file=sys.stderr)
+        token_cache.deserialize(cache_content)
+        
+        app = msal.PublicClientApplication(
+            CLIENT_ID,
+            authority=f"https://login.microsoftonline.com/{TENANT_ID}",
+            token_cache=token_cache
+        )
+        
+        scopes = ["Tasks.ReadWrite", "Group.Read.All", "User.Read"]
+        accounts = app.get_accounts()
+        print(f"[DEBUG] Found {len(accounts)} account(s) in cache", file=sys.stderr)
+        
+        if not accounts:
+            print("[DEBUG] No accounts found in token cache", file=sys.stderr)
+            return False
+        
+        # Try silent token acquisition (no user interaction)
+        print(f"[DEBUG] Attempting silent token acquisition for account: {accounts[0].get('username', 'unknown')}", file=sys.stderr)
+        result = app.acquire_token_silent(scopes=scopes, account=accounts[0])
+        
+        if result is None:
+            print("[DEBUG] Silent token acquisition returned None", file=sys.stderr)
+            return False
+        
+        if "access_token" not in result:
+            print(f"[DEBUG] No access_token in result. Keys: {list(result.keys())}", file=sys.stderr)
+            if "error" in result:
+                print(f"[DEBUG] Error: {result.get('error')} - {result.get('error_description')}", file=sys.stderr)
+            return False
+        
+        print("[DEBUG] ✓ Valid token found", file=sys.stderr)
+        return True
+    
+    except Exception as e:
+        print(f"[DEBUG] Exception in check_token_validity: {type(e).__name__}: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc(file=sys.stderr)
+        return False
+
+
 def get_access_token() -> str:
     """Get Graph API token with persistent MSAL token cache."""
     
@@ -215,32 +272,10 @@ def get_access_token() -> str:
             TOKEN_CACHE_PATH.write_text(token_cache.serialize())
             return result['access_token']
     
-    # No valid cached token - need interactive authentication
-    logger.info("[AUTH] No valid cached token - initiating device code flow")
-    
-    flow = app.initiate_device_flow(scopes=scopes)
-    if "user_code" not in flow:
-        raise ValueError("Failed to create device flow")
-    
-    print(f"\n{'='*60}", file=sys.stderr)
-    print(f"AUTHENTICATION REQUIRED", file=sys.stderr)
-    print(f"   Visit:  {flow['verification_uri']}", file=sys.stderr)
-    print(f"   Code:   {flow['user_code']}", file=sys.stderr)
-    print(f"   Timeout: 300 seconds", file=sys.stderr)
-    print(f"{'='*60}\n", file=sys.stderr)
-    
-    # Poll for token with explicit timeout
-    result = app.acquire_token_by_device_flow(flow)
-    
-    if "access_token" in result:
-        logger.info("[OK] Device flow authentication successful")
-        TOKEN_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        TOKEN_CACHE_PATH.write_text(token_cache.serialize())
-        return result['access_token']
-    else:
-        error_msg = result.get('error_description', 'Unknown error')
-        logger.error(f"[ERROR] Auth failed: {error_msg}")
-        raise Exception(f"Auth failed: {error_msg}")
+    # No valid cached token - this should not happen if startup check passed
+    logger.error("[ERROR] No valid token available - server should have been pre-authenticated")
+    raise Exception("Authentication required. Please restart the MCP server to authenticate.")
+
 
 
 def timed_graph_call(func_name: str, method: str, url: str, **kwargs) -> requests.Response:
@@ -971,12 +1006,27 @@ async def main():
     print("Charter & Stone MCP Server V2.6.1 - Interactive Edition", file=sys.stderr)
     print("=" * 60, file=sys.stderr)
     
-    # Pre-flight checks (no blocking auth)
-    print("[INFO] Microsoft Graph: Auth will happen on first API call", file=sys.stderr)
+    # Pre-flight auth check - MUST have valid token before starting
+    print("[CHECK] Validating Microsoft Graph authentication...", file=sys.stderr)
     
+    if not check_token_validity():
+        print("\n" + "=" * 60, file=sys.stderr)
+        print("❌ AUTHENTICATION REQUIRED", file=sys.stderr)
+        print("=" * 60, file=sys.stderr)
+        print("\nNo valid Microsoft Graph token found.", file=sys.stderr)
+        print("\nTo authenticate:", file=sys.stderr)
+        print("  1. Run: python auth_setup_v2.py", file=sys.stderr)
+        print("  2. Follow the device code instructions", file=sys.stderr)
+        print("  3. Restart Claude Desktop", file=sys.stderr)
+        print("\n" + "=" * 60, file=sys.stderr)
+        sys.exit(1)
+    
+    print("[✓] Microsoft Graph: Valid cached token found", file=sys.stderr)
+    
+    # SSH pre-flight check
     try:
         oracle_ssh.connect()
-        print(f"[OK] SSH to Pi: Connected ({SSH_HOST})", file=sys.stderr)
+        print(f"[✓] SSH to Pi: Connected ({SSH_HOST})", file=sys.stderr)
     except Exception as e:
         print(f"[WARN] SSH to Pi: Not connected - {e}", file=sys.stderr)
     
@@ -987,8 +1037,16 @@ async def main():
     print("                 add_checklist_item", file=sys.stderr)
     print("=" * 60, file=sys.stderr)
     
+    init_options = InitializationOptions(
+        server_name="charter-stone-mcp",
+        server_version="1.26.0",
+        capabilities=ServerCapabilities(
+            tools={}
+        )
+    )
+    
     async with mcp.server.stdio.stdio_server() as (read_stream, write_stream):
-        await app.run(read_stream, write_stream, app.create_initialization_options())
+        await app.run(read_stream, write_stream, init_options)
 
 
 if __name__ == "__main__":
