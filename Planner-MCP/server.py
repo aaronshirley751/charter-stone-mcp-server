@@ -30,6 +30,7 @@ try:
     import paramiko
     import requests
     import msal
+    from msal import SerializableTokenCache
     from dotenv import load_dotenv
     from mcp.server import Server
     from mcp.types import Tool, TextContent
@@ -65,7 +66,7 @@ logger = logging.getLogger(__name__)
 # Microsoft Graph
 TENANT_ID = os.getenv("AZURE_TENANT_ID") or os.getenv("TENANT_ID")
 CLIENT_ID = os.getenv("AZURE_CLIENT_ID") or os.getenv("CLIENT_ID")
-TOKEN_CACHE_PATH = Path.home() / ".planner_mcp_token_cache.json"
+TOKEN_CACHE_PATH = Path.home() / ".planner_mcp_token_cache.bin"
 
 # Planner IDs (set these to avoid repeated lookups)
 PLAN_ID = os.getenv("PLANNER_PLAN_ID")  # Optional: hardcode for speed
@@ -187,26 +188,37 @@ oracle_ssh = OracleSSHClient()
 # ============================================================================
 
 def get_access_token() -> str:
-    """Get Graph API token with disk caching."""
+    """Get Graph API token with persistent MSAL token cache."""
     
-    # Try cached token
+    # Initialize token cache
+    token_cache = SerializableTokenCache()
     if TOKEN_CACHE_PATH.exists():
-        try:
-            with open(TOKEN_CACHE_PATH, 'r') as f:
-                data = json.load(f)
-            expiry = datetime.fromisoformat(data['expires_at'])
-            if expiry > datetime.now(timezone.utc) + timedelta(minutes=5):
-                return data['access_token']
-        except Exception:
-            pass  # Cache invalid, continue to auth
+        token_cache.deserialize(TOKEN_CACHE_PATH.read_text())
     
-    # Device code flow
+    # Create MSAL app with token cache
     app = msal.PublicClientApplication(
         CLIENT_ID,
-        authority=f"https://login.microsoftonline.com/{TENANT_ID}"
+        authority=f"https://login.microsoftonline.com/{TENANT_ID}",
+        token_cache=token_cache
     )
     
-    flow = app.initiate_device_flow(scopes=["Tasks.ReadWrite", "Group.Read.All"])
+    # Try to get token from cache (silent, no user interaction)
+    scopes = ["Tasks.ReadWrite", "Group.Read.All", "User.Read"]
+    accounts = app.get_accounts()
+    
+    if accounts:
+        logger.debug(f"Found {len(accounts)} cached account(s)")
+        result = app.acquire_token_silent(scopes=scopes, account=accounts[0])
+        if result and "access_token" in result:
+            logger.info("✅ Using cached token")
+            TOKEN_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            TOKEN_CACHE_PATH.write_text(token_cache.serialize())
+            return result['access_token']
+    
+    # No valid cached token - need interactive authentication
+    logger.info("⚠️ No valid cached token - initiating device code flow")
+    
+    flow = app.initiate_device_flow(scopes=scopes)
     if "user_code" not in flow:
         raise ValueError("Failed to create device flow")
     
@@ -214,20 +226,21 @@ def get_access_token() -> str:
     print(f"🔐 AUTHENTICATION REQUIRED", file=sys.stderr)
     print(f"   Visit:  {flow['verification_uri']}", file=sys.stderr)
     print(f"   Code:   {flow['user_code']}", file=sys.stderr)
+    print(f"   Timeout: 300 seconds", file=sys.stderr)
     print(f"{'='*60}\n", file=sys.stderr)
     
+    # Poll for token with explicit timeout
     result = app.acquire_token_by_device_flow(flow)
     
     if "access_token" in result:
-        expires_at = datetime.now(timezone.utc) + timedelta(seconds=result['expires_in'])
-        with open(TOKEN_CACHE_PATH, 'w') as f:
-            json.dump({
-                "access_token": result['access_token'],
-                "expires_at": expires_at.isoformat()
-            }, f)
+        logger.info("✅ Device flow authentication successful")
+        TOKEN_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        TOKEN_CACHE_PATH.write_text(token_cache.serialize())
         return result['access_token']
     else:
-        raise Exception(f"Auth failed: {result.get('error_description')}")
+        error_msg = result.get('error_description', 'Unknown error')
+        logger.error(f"❌ Auth failed: {error_msg}")
+        raise Exception(f"Auth failed: {error_msg}")
 
 
 def timed_graph_call(func_name: str, method: str, url: str, **kwargs) -> requests.Response:
